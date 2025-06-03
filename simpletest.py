@@ -1,5 +1,14 @@
 import requests
 import json
+import base64
+
+
+def decode_base64_with_padding(encoded: str) -> str:
+    padding_needed = (-len(encoded)) % 4  # base64 requires length % 4 == 0
+    encoded += "=" * padding_needed
+    return base64.urlsafe_b64decode(encoded).decode("utf-8")
+
+
 with open("APIKey.json") as f: # Change file name if needed
    data = json.load(f)
    API_ACCESS = data['access']
@@ -35,14 +44,27 @@ response = requests.post(
         "parameters": [
           {
             "parameterId": "cone",
-            "parameterValue": "true"
+            "parameterValue": "false"
           }
-        ],
-        "standardContentParametersId": "string"
+        ]
       }
 )
-
 encodedId = response.json()['encodedId']
+
+
+#@scp=string;cone=false
+#encodedId = "JTQwc2NwPXN0cmluZztjb25lPWZhbHNl"
+#true:
+#encodedId = "JTQwc2NwPXN0cmluZztjb25lPXRydWU"
+#cone=false
+#encodedId = "Y29uZT1mYWxzZQ"
+#cone=true
+#encodedId = "Y29uZT10cnVl"
+
+print(response.text)
+print (encodedId)
+#print(decode_base64_with_padding(encodedId))
+
 response = requests.post(    
     f"https://cad.onshape.com/api/partstudios/d/{DID}/v/{WID}/e/{EID}/translations",
     auth=(API_ACCESS, API_SECRET),
@@ -51,7 +73,7 @@ response = requests.post(
         "Content-Type": "application/json"
     },
     json={
-        "configuration": encodedId,
+        "configuration": encodedId, 
         "formatName": "STL",  # Use the "name" of the translation format from above
         "partIds" : "JID",
         "storeInDocument": False
