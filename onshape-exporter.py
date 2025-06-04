@@ -41,11 +41,11 @@ def get_ids(url):
         MID = urlArr[mIndex + 1]
         path += f"/m/{MID}"
 
-    return DID, EID, VWID, MID, path
+    return DID, EID, VWID, path
 
 
 
-def get_configuration_schema(api_access, api_secret, DID, VWM_PATH, EID, MID=None):
+def get_configuration_schema(api_access, api_secret, DID, VWM_PATH, EID):
     url = f"https://cad.onshape.com/api/elements/d/{DID}/{VWM_PATH}/e/{EID}/configuration"
     response = requests.get(
         url,
@@ -132,7 +132,7 @@ def resolve_configuration_parameters(config, config_schema):
     return resolved_params
 
 
-def get_part_id(api_access, api_secret, DID, VWM_PATH, EID, partToExport, queryParam, MID=None):
+def get_part_id(api_access, api_secret, DID, VWM_PATH, EID, partToExport, queryParam):
 
     print(f"qp: {queryParam}")
     url = f"https://cad.onshape.com/api/parts/d/{DID}/{VWM_PATH}/e/{EID}?{queryParam}"
@@ -178,7 +178,7 @@ def encode_configuration(api_access, api_secret, DID, EID, os_config_parameters)
     return encodedId, queryParam
 
 
-def start_translation(api_access, api_secret, DID, VWM_PATH, EID, encodedId, PID, formatName="STEP", MID=None):
+def start_translation(api_access, api_secret, DID, VWM_PATH, EID, encodedId, PID, formatName="STEP"):
     # print(f"DID WID EID PID {DID} {WID} {EID} {PID}")
     # try:
     #     decoded_bytes = base64.urlsafe_b64decode(encodedId + '==')  # Add padding if needed
@@ -269,8 +269,9 @@ def main():
     partName = config_data.get("part", "Part 1")
     configurationsToExport = config_data.get("configurationsToExport", [])
 
-    #Get Document, Element (tab) and workspace IDs from URL
-    DID, EID, VWID, MID, VWM_PATH = get_ids(URL)
+    #Get Document, Element (tab) and workspace/version and microversion IDs from URL
+    # VWM_PATH includes the microversion if there is one
+    DID, EID, VWID, VWM_PATH = get_ids(URL)
 
     version_tag = "wip"
     if "/v/" in URL:
@@ -287,7 +288,8 @@ def main():
             version_tag = version_name
         except Exception as e:
             print(f"Warning: could not resolve version name: {e}")
-
+    # get the onshape-internal configuration schema values that API will mostly use 
+    # instead of the GUI-visible names
     config_schema = get_configuration_schema(API_ACCESS, API_SECRET, DID, VWM_PATH, EID)
 
     # Validate all configurations first
@@ -298,18 +300,21 @@ def main():
             print(f"Configuration '{export.get('name', '?')}' is invalid: {e}")
             return
 
-
+    # export each product configuration specified in the conf file
     for export in configurationsToExport:
         print(json.dumps(export))
+        #map parameters from GUI values to onshape-internally used items
         resolved_params = resolve_configuration_parameters(export["config"], config_schema)
 
+        #Encode the parameters so that the configuration can be used in POST or GET operations to the API
         encodedId, queryParam = encode_configuration(API_ACCESS, API_SECRET, DID, EID, resolved_params)
         # print(encodedId)
         # print(queryParam)
-        PID = get_part_id(API_ACCESS, API_SECRET, DID, VWM_PATH, EID, partName, queryParam=queryParam, MID=MID)
+        #find the internal part Id. Pass the product configuration as well, as that can change the internal names
+        PID = get_part_id(API_ACCESS, API_SECRET, DID, VWM_PATH, EID, partName, queryParam=queryParam)
         # print(f"PID: {PID}")
         
-        TID = start_translation(API_ACCESS, API_SECRET, DID, VWM_PATH, EID, encodedId, PID, formatName=formatName, MID=MID)
+        TID = start_translation(API_ACCESS, API_SECRET, DID, VWM_PATH, EID, encodedId, PID, formatName=formatName)
         # print(f"Started translation with ID: {TID}")
 
         translation_status = wait_for_translation(API_ACCESS, API_SECRET, TID)
