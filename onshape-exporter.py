@@ -8,13 +8,61 @@ import base64
 import sys
 import argparse
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
+def log(msg, verbosity=1, level=1):
+    if verbosity >= level:
+        print(msg)
+
+def log_error(msg):
+    sys.stderr.write(f"[{datetime.now().isoformat()}] ERROR: {msg}\n")
 
 class Context:
-    def __init__(self, access, secret, ids):
+    def __init__(self, access, secret, ids, verbosity=1):
         self.auth = (access, secret)
         self.ids = ids
+        self.verbosity = verbosity
 
+def parse_onshape_path(ids, template):
+    return f"https://cad.onshape.com/api{template.format(
+        did=ids['did'],
+        eid=ids['eid'],
+        wv=ids['wvm'],
+        wvm=ids['wvm'],
+        wvid=ids['wvmid'],
+        wvmid=ids['wvmid'],
+        wid=ids.get('wid'),
+        vid=ids.get('vid'),
+        mid=ids.get('mid')
+    )}"
+
+def get_onshape_direct(ctx, url, headers=None):
+    response = requests.get(
+        url,
+        auth=ctx.auth,
+        headers=headers or {"Accept": "application/json"}
+    )
+    response.raise_for_status()
+    return response
+
+def get_onshape_json(ctx, path_template):
+    url = parse_onshape_path(ctx.ids, path_template)
+    return get_onshape_direct(ctx, url).json()
+
+def post_onshape_json(ctx, path_template, json_payload):
+    url = parse_onshape_path(ctx.ids, path_template)
+    response = requests.post(
+        url,
+        auth=ctx.auth,
+        headers={
+            "Accept": "application/json;charset=UTF-8; qs=0.09",
+            "Content-Type": "application/json"
+        },
+        json=json_payload
+    )
+    response.raise_for_status()
+    return response.json()
 
 def load_api_keys(path):
     with open(path) as f:  # Change file name if needed
@@ -30,47 +78,41 @@ def get_ids(url):
     eIndex = urlArr.index("e")
     EID = urlArr[eIndex + 1]
 
-    MID = None
-    if "m" in urlArr:
-        mIndex = urlArr.index("m")
-        MID = urlArr[mIndex + 1]
-
-    VWID = None
+    WID = VID = MID = None
+    if "w" in urlArr:
+        WID = urlArr[urlArr.index("w") + 1]
     if "v" in urlArr:
-        idx = urlArr.index("v")
-        VWID = urlArr[idx + 1]
-    elif "w" in urlArr:
-        idx = urlArr.index("w")
-        VWID = urlArr[idx + 1]
+        VID = urlArr[urlArr.index("v") + 1]
+    if "m" in urlArr:
+        MID = urlArr[urlArr.index("m") + 1]
+
+    if MID:
+        WVMID = MID
+        WVM = "m"
+    elif VID:
+        WVMID = VID
+        WVM = "v"
+    elif WID:
+        WVMID = WID
+        WVM = "w"
     else:
-        raise ValueError("URL must contain either a 'w' (workspace) or 'v' (version)")
+        raise ValueError("URL must contain 'w', 'v', or 'm'")
 
     return {
         'did': DID,
         'eid': EID,
-        'vwid': VWID,
+        'wid': WID,
+        'vid': VID,
         'mid': MID,
-        'wvm': 'm' if MID else ('v' if 'v' in urlArr else 'w')
+        'wvmid': WVMID,
+        'wvm': WVM
     }
 
 
-def parse_onshape_path(ids, template):
-    # ids is a dict with keys: did, eid, wvid, wvm (optional)
-    # wvm is the workspace/microversion part like "w/12345" or "m/67890"
-    # wvid is the ID without prefix
-    # did and eid are document and element IDs
-    # template is a string with placeholders {did}, {eid}, {wvid}, {wvm}
-    return f"https://cad.onshape.com/api{template.format(did=ids['did'], eid=ids['eid'], wvid=ids['vwid'], wvm=ids['wvm'])}"
 
 
 def get_element_configuration(ctx):
-    url = parse_onshape_path(ctx.ids, "/elements/d/{did}/{wvm}/{wvid}/e/{eid}/configuration")
-    response = requests.get(
-        url,
-        auth=ctx.auth,
-        headers={"Accept": "application/json"}
-    )
-    response = response.json()
+    response = get_onshape_json(ctx, "/elements/d/{did}/{wvm}/{wvmid}/e/{eid}/configuration")
     #get the config in a format that has the UI-visible name as key and the "message" as value
     config_schema = {p["message"]["parameterName"]: p for p in response["configurationParameters"]}
     return config_schema
@@ -149,17 +191,8 @@ def resolve_configuration_parameters(config, config_schema):
 
 
 def get_part_id(ctx, partToExport, queryParam):
-    url = parse_onshape_path(ctx.ids, "/parts/d/{did}/{wvm}/{wvid}/e/{eid}") + f"?{queryParam}"
-    response = requests.get(
-        url,
-        auth=ctx.auth,
-        headers={
-            "Accept": "application/json"
-        }
-    )
-    response = response.json()
+    response = get_onshape_json(ctx, f"/parts/d/{{did}}/{{wvm}}/{{wvmid}}/e/{{eid}}?{queryParam}")
     part_names = [part['name'] for part in response]
-    # print("Available parts:", part_names)
     for part in response:
         if part['name'] == partToExport:
             return part['partId']
@@ -167,96 +200,68 @@ def get_part_id(ctx, partToExport, queryParam):
 
 
 def encode_configuration_url(ctx, os_config_parameters):
-    url = parse_onshape_path(ctx.ids, "/elements/d/{did}/e/{eid}/configurationencodings")
-    response = requests.post(
-        url,
-        auth=ctx.auth,
-        headers={
-            "Accept": "application/json;charset=UTF-8; qs=0.09",
-            "Content-Type": "application/json"
-        },
-        json={
-            "parameters": os_config_parameters
-        }
-    )
-    encodedId = response.json()['encodedId']
-    queryParam = response.json()['queryParam']
-    # print(response.text)
-
-    
+    response = post_onshape_json(ctx, "/elements/d/{did}/e/{eid}/configurationencodings",
+                                 {"parameters": os_config_parameters})
+    encodedId = response['encodedId']
+    queryParam = response['queryParam']
     return encodedId, queryParam
 
 
 def create_translation_request(ctx, encodedId, PID, formatName="STEP"):
-    url = parse_onshape_path(ctx.ids, "/partstudios/d/{did}/{wvm}/{wvid}/e/{eid}/translations")
-
-    response = requests.post(
-        url,
-        auth=ctx.auth,
-        headers={
-            "Accept": "application/json;charset=UTF-8; qs=0.09",
-            "Content-Type": "application/json"
-        },
-        json={
+    return post_onshape_json(
+        ctx,
+        "/partstudios/d/{did}/{wv}/{wvid}/e/{eid}/translations",
+        {
             "configuration": encodedId,
             "formatName": formatName,
             "partIds": PID,
             "storeInDocument": False
         }
-    )
-    response.raise_for_status()
-    return response.json()['id']
+    )['id']
 
 
 def wait_for_translation_request(ctx, TID):
     while True:
-        response = requests.get(
-            f"https://cad.onshape.com/api/translations/{TID}",
-            auth=ctx.auth,
-            headers={
-                "Accept": "application/json;charset=UTF-8; qs=0.09",
-                "Content-Type": "application/json"
-            }
-        )
-        response.raise_for_status()
-        translation_status = response.json()
-        print("Translation status:", translation_status["requestState"])
-        if translation_status["requestState"] == "DONE":
+        time.sleep(5)
+        response = get_onshape_json(ctx, f"/translations/{TID}")
+        log("Translation status: " + response["requestState"], verbosity=ctx.verbosity, level=2)
+        if response["requestState"] == "DONE":
             break
-        time.sleep(2)
-    return translation_status
+    return response
 
 
 def download_external_data(ctx, FID, filename="result.step"):
     url = f"https://cad.onshape.com/api/documents/d/{ctx.ids['did']}/externaldata/{FID}"
-    response = requests.get(
-        url,
-        auth=ctx.auth,
-        headers={
-            "Accept": "application/octet-stream",
-            "Content-Type": "application/json"
-        }
-    )
+    response = get_onshape_direct(ctx, url, headers={
+        "Accept": "application/octet-stream",
+        "Content-Type": "application/json"
+    })
     with open(filename, 'wb') as f:
         f.write(response.content)
 
+
+
 def load_config_with_fallback(filename="onshape-exporter.conf"):
     if not os.path.exists(filename):
-        print(f"Configuration file '{filename}' not found in current directory.")
+        log_error(f"Configuration file '{filename}' not found in current directory.")
         sys.exit(1)
     with open(filename) as f:
         return json.load(f)
     
 def get_version_name(ctx):
-    url = parse_onshape_path(ctx.ids, "/documents/d/{did}/versions")
-    response = requests.get(url, auth=ctx.auth, headers={"Accept": "application/json"})
-    if response.status_code == 200:
-        version_info_list = response.json()
-        version_entry = next((v for v in version_info_list if v["id"] == ctx.ids["vwid"]), None)
-        return version_entry["name"] if version_entry else ctx.ids["vwid"]
-    else:
-        print(response.text)
-        return ctx.ids["vwid"]
+    try:
+        #only return a name if we have a "genuine" version, and not a microversion
+        if not ctx.ids['wvm'] == "v":
+            return None
+        vid = ctx.ids.get("vid")
+        version_info_list = get_onshape_json(ctx, "/documents/d/{did}/versions")
+        version_entry = next((v for v in version_info_list if v["id"] == vid), None)
+        if not version_entry:
+            raise ValueError(f"Error generating the filename suffix. Version ID '{vid}' not found in the version list.")
+        return version_entry["name"]
+    except Exception as e:
+        log_error(e)
+        return None
 
 def generate_file_suffix(ctx):
     suffix = ""
@@ -264,11 +269,32 @@ def generate_file_suffix(ctx):
         suffix += get_version_name(ctx)
     else:
         suffix += "wip"
-
-    if ctx.ids['wvm'] == "m":
-        shortid = ctx.ids['mid'][:8]
-        suffix += f"-m-{shortid}"
     return suffix
+
+def export_configuration(ctx, export, partName, config_schema, formatName, suffix):
+    try:
+#        log(f"Exporting configuration: {export.get('name', '?')}", verbosity=ctx.verbosity, level=1)
+        log(f"Exporting config: {export}", verbosity=ctx.verbosity, level=1)
+        #resolve the GUI-visible names to the ids used internally in os
+        resolved_params = resolve_configuration_parameters(export["config"], config_schema)
+        log(f"Resolved parameters: {resolved_params}", verbosity=ctx.verbosity, level=2)
+        #encode the resolved parameters so that they can be transported in GET and PUT requests
+        encodedId, queryParam = encode_configuration_url(ctx, resolved_params)
+        log(f"Encoded ID: {encodedId}", verbosity=ctx.verbosity, level=2)
+        log(f"Query Param: {queryParam}", verbosity=ctx.verbosity, level=2)
+        #find the internal name of the GUI-visible part name
+        PID = get_part_id(ctx, partName, queryParam=queryParam)
+        log(f"Part ID: {PID}", verbosity=ctx.verbosity, level=2)
+        #start translation
+        TID = create_translation_request(ctx, encodedId, PID, formatName=formatName)
+        #poll until ready
+        status = wait_for_translation_request(ctx, TID)
+        FID = status['resultExternalDataIds'][0]
+        filename = f"{partName}-{export['name']}-{suffix}.{formatName.lower()}"
+        download_external_data(ctx, FID, filename=filename)
+        log(f"Downloaded {filename}", verbosity=ctx.verbosity, level=1)
+    except Exception as e:
+        log_error(f"Failed to export configuration '{export.get('name', '?')}': {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Export Onshape configurations")
@@ -276,6 +302,8 @@ def main():
     parser.add_argument("--keyfile", help="Path to Onshape API key file", default=os.path.expanduser("~/Onshape-test-APIKey.json"))
     parser.add_argument("--url", help="Override the URL in config")
     parser.add_argument("--part", help="Override the part name in config")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--quiet", action="store_true", help="Suppress all output except errors")
     args = parser.parse_args()
 
     API_ACCESS, API_SECRET = load_api_keys(args.keyfile)
@@ -291,8 +319,17 @@ def main():
     partName = config_data.get("part", "Part 1")
     configurationsToExport = config_data.get("configurationsToExport", [])
 
+    # Determine verbosity level
+    if args.quiet:
+        verbosity = 0
+    elif args.verbose:
+        verbosity = 2
+    else:
+        verbosity = 1
+
+
     # the context include authentication and the document id, version/workspace/microversion IDs
-    ctx = Context(API_ACCESS, API_SECRET, get_ids(config_data["url"]))
+    ctx = Context(API_ACCESS, API_SECRET, get_ids(config_data["url"]), verbosity=verbosity)
 
     suffix = generate_file_suffix(ctx)
 
@@ -305,29 +342,17 @@ def main():
         try:
             resolve_configuration_parameters(export["config"], config_schema)
         except ValueError as e:
-            print(f"Configuration '{export.get('name', '?')}' is invalid: {e}")
+            log_error(f"Configuration '{export.get('name', '?')}' is invalid: {e}")
             return
 
-    # export each product configuration specified in the conf file
-    for export in configurationsToExport:
-        print(json.dumps(export))
-        #map parameters from GUI values to onshape-internally used items
-        resolved_params = resolve_configuration_parameters(export["config"], config_schema)
-        #Encode the parameters so that the configuration can be used in POST or GET operations to the API
-        encodedId, queryParam = encode_configuration_url(ctx, resolved_params)
-        #find the internal part Id. Pass the element configuration as well with queryParam, as that can change the internal names
-        PID = get_part_id(ctx, partName, queryParam=queryParam)
-        #start the translation
-        TID = create_translation_request(ctx, encodedId, PID, formatName=formatName)
-        # poll until translation ready
-        translation_status = wait_for_translation_request(ctx, TID)
-
-        FID = translation_status['resultExternalDataIds'][0]
-
-        filename = f"{partName}-{export['name']}-{suffix}.{formatName.lower()}"
-        download_external_data(ctx, FID, filename=filename)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(export_configuration, ctx, export, partName, config_schema, formatName, suffix)
+            for export in configurationsToExport
+        ]
+        for future in as_completed(futures):
+            future.result()
 
 
 if __name__ == "__main__":
     main()
-
