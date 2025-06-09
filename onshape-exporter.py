@@ -1,12 +1,12 @@
 #! /usr/bin/env python3
 # Authenticate with external JSON file.
-import json
 import requests
 import os
 import time
 import base64
 import sys
 import argparse
+import yaml
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -64,10 +64,32 @@ def post_onshape_json(ctx, path_template, json_payload):
     response.raise_for_status()
     return response.json()
 
-def load_api_keys(path):
-    with open(path) as f:  # Change file name if needed
-        data = json.load(f)
-        return data['access'], data['secret']
+def load_api_keys(path, stack_override=None):
+    if path == "-":
+        try:
+            data = yaml.safe_load(sys.stdin)
+            return data['access'], data['secret']
+        except yaml.YAMLError as e:
+            log_error(f"Failed to parse API key data from stdin: {e}")
+            sys.exit(1)
+        except KeyError:
+            log_error("API key data must contain 'access' and 'secret' fields.")
+            sys.exit(1)
+    try:
+        with open(path) as f:
+            config = yaml.safe_load(f)
+            default_stack = stack_override or config.get("default_stack")
+            if not default_stack:
+                log_error("YAML config must include a 'default_stack' key.")
+                sys.exit(1)
+            profile = config.get(default_stack)
+            if not profile:
+                log_error(f"Profile '{default_stack}' not found in the config file.")
+                sys.exit(1)
+            return profile["access_key"], profile["secret_key"]
+    except Exception as e:
+        log_error(f"Failed to load YAML API key file '{path}': {e}")
+        sys.exit(1)
 
 
 
@@ -242,11 +264,17 @@ def download_external_data(ctx, FID, filename="result.step"):
 
 
 def load_config_with_fallback(filename="onshape-exporter.conf"):
+    if filename == "-":
+        try:
+            return yaml.safe_load(sys.stdin)
+        except yaml.YAMLError as e:
+            log_error(f"Failed to parse configuration from stdin: {e}")
+            sys.exit(1)
     if not os.path.exists(filename):
         log_error(f"Configuration file '{filename}' not found in current directory.")
         sys.exit(1)
     with open(filename) as f:
-        return json.load(f)
+        return yaml.safe_load(f)
     
 def get_version_name(ctx):
     try:
@@ -299,15 +327,23 @@ def export_configuration(ctx, export, partName, config_schema, formatName, suffi
 def main():
     parser = argparse.ArgumentParser(description="Export Onshape configurations")
     parser.add_argument("--config", help="Path to configuration file", default="onshape-exporter.conf")
-    parser.add_argument("--keyfile", help="Path to Onshape API key file", default=os.path.expanduser("~/Onshape-test-APIKey.json"))
+    parser.add_argument("--keyfile", help="Path to Onshape API key file", default=os.path.expanduser("~/.onshape_client_config.yaml"))
     parser.add_argument("--url", help="Override the URL in config")
     parser.add_argument("--part", help="Override the part name in config")
+    parser.add_argument("--profile", help="Override default_stack in API key config")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--quiet", action="store_true", help="Suppress all output except errors")
     args = parser.parse_args()
 
-    API_ACCESS, API_SECRET = load_api_keys(args.keyfile)
+    API_ACCESS, API_SECRET = load_api_keys(args.keyfile, stack_override=args.profile)
     config_data = load_config_with_fallback(args.config)
+
+    if "formats" not in config_data or not isinstance(config_data["formats"], list) or not config_data["formats"]:
+        log_error("The configuration file must include a non-empty 'formats' list.")
+        sys.exit(1)
+    if "parts" not in config_data or not isinstance(config_data["parts"], list) or not config_data["parts"]:
+        log_error("The configuration file must include a non-empty 'parts' list.")
+        sys.exit(1)
 
     if args.url:
         config_data["url"] = args.url
@@ -315,8 +351,8 @@ def main():
         config_data["part"] = args.part
 
     # read the config file
-    formatName = config_data.get("format", "STEP")
-    partName = config_data.get("part", "Part 1")
+    formats = config_data["formats"]
+    parts = config_data["parts"]
     configurationsToExport = config_data.get("configurationsToExport", [])
 
     # Determine verbosity level
@@ -346,10 +382,11 @@ def main():
             return
 
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [
-            executor.submit(export_configuration, ctx, export, partName, config_schema, formatName, suffix)
-            for export in configurationsToExport
-        ]
+        futures = []
+        for formatName in formats:
+            for partName in parts:
+                for export in configurationsToExport:
+                    futures.append(executor.submit(export_configuration, ctx, export, partName, config_schema, formatName, suffix))
         for future in as_completed(futures):
             future.result()
 
