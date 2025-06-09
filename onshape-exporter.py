@@ -230,15 +230,23 @@ def encode_configuration_url(ctx, os_config_parameters):
 
 
 def create_translation_request(ctx, encodedId, PID, formatName="STEP"):
+    payload = {
+        "configuration": encodedId,
+        "formatName": formatName,
+        "partIds": PID,
+        "storeInDocument": False
+    }
+    if formatName.upper() == "STL":
+        payload["units"] = "millimeter"
+#        payload["mode"] = "binary"
+#        payload["resolution"] = "fine"
+#        payload["scale"] = 1.0
+#        payload["specifyUnits"] = True
+    log(f"Translation payload: {payload}", verbosity=ctx.verbosity, level=2)
     return post_onshape_json(
         ctx,
         "/partstudios/d/{did}/{wv}/{wvid}/e/{eid}/translations",
-        {
-            "configuration": encodedId,
-            "formatName": formatName,
-            "partIds": PID,
-            "storeInDocument": False
-        }
+        payload
     )['id']
 
 
