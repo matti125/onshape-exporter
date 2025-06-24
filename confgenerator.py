@@ -10,12 +10,10 @@ https://cad.onshape.com/documents/197e41b6f637a60f25779e61/v/f698a28fa3dc96a47d0
 
 parts = ["clip"]
 formats = ["STEP", "STL"]
-formats = ["STL"]
+formats = ["STEP"]
 # Input ranges
 stackable = [True, False]
-#addheight = list(range(1, 26))
-addheight = [0,1,8]
-addheight = [0]
+addheight = list(range(1, 26))
 
 
 # Header for the export configuration

@@ -11,6 +11,18 @@ from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+# STL size check
+from stl import mesh
+
+def check_stl_size(filename, min_dim_mm=1.0):
+    m = mesh.Mesh.from_file(filename)
+    min_corner = m.min_
+    max_corner = m.max_
+    size = max_corner - min_corner
+    if (size < min_dim_mm).any():
+        raise ValueError(f"STL size too small: bounding box {size} mm")
+    return size
+
 def log(msg, verbosity=1, level=1):
     if verbosity >= level:
         print(msg)
@@ -25,17 +37,7 @@ class Context:
         self.verbosity = verbosity
 
 def parse_onshape_path(ids, template):
-    return f"https://cad.onshape.com/api{template.format(
-        did=ids['did'],
-        eid=ids['eid'],
-        wv=ids['wvm'],
-        wvm=ids['wvm'],
-        wvid=ids['wvmid'],
-        wvmid=ids['wvmid'],
-        wid=ids.get('wid'),
-        vid=ids.get('vid'),
-        mid=ids.get('mid')
-    )}"
+    return f"https://cad.onshape.com/api{template.format(**ids)}"
 
 def get_onshape_direct(ctx, url, headers=None):
     response = requests.get(
@@ -62,6 +64,7 @@ def post_onshape_json(ctx, path_template, json_payload):
         json=json_payload
     )
     response.raise_for_status()
+    print(response.text)
     return response.json()
 
 def load_api_keys(path, stack_override=None):
@@ -127,7 +130,10 @@ def get_ids(url):
         'vid': VID,
         'mid': MID,
         'wvmid': WVMID,
-        'wvm': WVM
+        'wvm': WVM,
+        'wv': WVM,        # alias for {wv}
+        'wvid': WVMID     # alias for {wvid}
+    
     }
 
 
@@ -237,17 +243,41 @@ def create_translation_request(ctx, encodedId, PID, formatName="STEP"):
         "storeInDocument": False
     }
     if formatName.upper() == "STL":
-        payload["units"] = "millimeter"
-#        payload["mode"] = "binary"
+        payload["unit"] = "mm"
+        payload["mode"] = "binary"
 #        payload["resolution"] = "fine"
-#        payload["scale"] = 1.0
-#        payload["specifyUnits"] = True
+        payload["scale"] = 1.0
+        payload["yAxisIsUp"] = False
+        payload["specifyUnits"] = True
     log(f"Translation payload: {payload}", verbosity=ctx.verbosity, level=2)
     return post_onshape_json(
         ctx,
         "/partstudios/d/{did}/{wv}/{wvid}/e/{eid}/translations",
         payload
     )['id']
+
+
+# Direct STL download via synchronous Onshape STL export endpoint
+def download_stl_synchronous(ctx, PID, filename):
+    """
+    Download STL file directly from Onshape using synchronous export endpoint.
+    """
+    # Build the direct STL export URL using the correct endpoint and parse_onshape_path helper
+    path = "/parts/d/{did}/{wvm}/{wvmid}/e/{eid}/partid/{partid}/stl"
+    url = parse_onshape_path({**ctx.ids, "partid": PID}, path)
+    params = {
+        "mode": "binary",
+        "units": "millimeter"
+     }
+    headers = {
+        "Accept": "application/vnd.onshape.v1+octet-stream"
+    }
+    log(f"STL export URL: {url}", verbosity=ctx.verbosity, level=1)
+    response = requests.get(url, auth=ctx.auth, headers=headers, params=params)
+    response.raise_for_status()
+    with open(filename, 'wb') as f:
+        f.write(response.content)
+    log(f"Downloaded {filename}", verbosity=ctx.verbosity, level=1)
 
 
 def wait_for_translation_request(ctx, TID):
@@ -269,6 +299,32 @@ def download_external_data(ctx, FID, filename="result.step"):
     with open(filename, 'wb') as f:
         f.write(response.content)
 
+
+# Export STL from Part Studio using Onshape synchronous endpoint
+def export_stl_from_part_studio(ctx, part_ids, filename, mode="binary", scale=1.0, units="millimeter", y_axis_is_up=True, query_param=None):
+    """
+    Export STL file directly from a Part Studio using Onshape's synchronous STL endpoint.
+    """
+    path = "/partstudios/d/{did}/{wvm}/{wvmid}/e/{eid}/stl"
+    url = parse_onshape_path(ctx.ids, path)
+    if query_param:
+        url += "?" + query_param
+    params = {
+        "partIds": ",".join(part_ids),
+        "mode": mode,
+        "scale": scale,
+        "units": units,
+        "yAxisIsUp": str(y_axis_is_up).lower()
+    }
+    headers = {
+        "Accept": "application/vnd.onshape.v1+octet-stream"
+    }
+    log(f"STL PartStudio export URL: {url}", verbosity=ctx.verbosity, level=1)
+    response = requests.get(url, auth=ctx.auth, headers=headers, params=params)
+    response.raise_for_status()
+    with open(filename, 'wb') as f:
+        f.write(response.content)
+    log(f"Exported STL from Part Studio to: {filename}", verbosity=ctx.verbosity, level=1)
 
 
 def load_config_with_fallback(filename="onshape-exporter.conf"):
@@ -321,14 +377,24 @@ def export_configuration(ctx, export, partName, config_schema, formatName, suffi
         #find the internal name of the GUI-visible part name
         PID = get_part_id(ctx, partName, queryParam=queryParam)
         log(f"Part ID: {PID}", verbosity=ctx.verbosity, level=2)
-        #start translation
-        TID = create_translation_request(ctx, encodedId, PID, formatName=formatName)
-        #poll until ready
-        status = wait_for_translation_request(ctx, TID)
-        FID = status['resultExternalDataIds'][0]
+        # Create output filename early and reuse
         filename = f"{partName}-{export['name']}-{suffix}.{formatName.lower()}"
+        # STL uses synchronous download, others use async translation
+        if False :
+#        if formatName.upper() == "STL":
+            export_stl_from_part_studio(ctx, [PID], filename, query_param=queryParam)
+        else:
+            TID = create_translation_request(ctx, encodedId, PID, formatName=formatName)
+            status = wait_for_translation_request(ctx, TID)
+            FID = status['resultExternalDataIds'][0]
         download_external_data(ctx, FID, filename=filename)
         log(f"Downloaded {filename}", verbosity=ctx.verbosity, level=1)
+        if formatName.upper() == "STL":
+            try:
+                size = check_stl_size(filename)
+                log(f"STL bounding box size: {size}", verbosity=ctx.verbosity, level=1)
+            except Exception as size_error:
+                log_error(f"STL size check failed: {size_error}")
     except Exception as e:
         log_error(f"Failed to export configuration '{export.get('name', '?')}': {e}")
 
